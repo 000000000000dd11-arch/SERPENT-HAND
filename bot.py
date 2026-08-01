@@ -6,30 +6,18 @@ import re
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
-# ─── Настройки ──────────────────────────────────────────────────────────────
-# Токен можно задать через переменную окружения DISCORD_TOKEN,
-# либо вписать прямо в кавычки ниже вместо плейсхолдера.
 TOKEN = os.getenv("DISCORD_TOKEN", "ВАШ_ТОКЕН_СЮДА")
-
-# Часовой пояс, по которому считаются даты неявок и момент удаления сообщений.
-# МСК (Europe/Moscow) — в России отменён переход на летнее/зимнее время,
-# поэтому это всегда UTC+3, без сюрпризов.
 TIMEZONE = ZoneInfo("Europe/Moscow")
 
-# Файл данных всегда лежит рядом со скриптом, независимо от того, из какой
-# папки бот запущен (двойной клик, ярлык, планировщик задач и т.д.) —
-# раньше путь был относительным и после рестарта другим способом бот мог
-# не найти уже сохранённый канал и создать новый пустой data.json.
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.path.join(BASE_DIR, "data.json")
 
 intents = discord.Intents.default()
-intents.message_content = True  # обязательно для команд с префиксом "!"
+intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 
-# ─── Хранилище (каналы + отложенные удаления сообщений) ────────────────────
 def load_state() -> dict:
     if os.path.exists(DATA_FILE):
         try:
@@ -40,8 +28,10 @@ def load_state() -> dict:
             raw = {}
     else:
         raw = {}
-    raw.setdefault("channels", {})           # {"<guild_id>": <channel_id>}
-    raw.setdefault("pending_deletions", [])  # [{message_id, channel_id, delete_at}]
+    raw.setdefault("channels", {})
+    raw.setdefault("pending_deletions", [])
+    raw.setdefault("history", [])
+    raw.setdefault("schedules", {})
     return raw
 
 
@@ -53,29 +43,16 @@ def save_state() -> None:
 state = load_state()
 print(f"📄 Файл данных: {DATA_FILE}")
 print(f"📌 Загружено каналов для заявок: {len(state['channels'])}, "
-      f"отложенных удалений: {len(state['pending_deletions'])}")
+      f"отложенных удалений: {len(state['pending_deletions'])}, "
+      f"в очереди на отчёт: {len(state['history'])}")
 
 
-# ─── Строгая проверка даты / диапазона дат (без года) ────────────────────────
-# Разрешён ТОЛЬКО формат "ДД.ММ" или "ДД.ММ-ДД.ММ" — никаких букв и года.
 DATE_RE = re.compile(
     r"^\s*(\d{2})\.(\d{2})\s*(?:-\s*(\d{2})\.(\d{2}))?\s*$"
 )
 
 
 def parse_date_range(raw: str):
-    """
-    Принимает "ДД.ММ" или "ДД.ММ-ДД.ММ" (год пользователь не вводит).
-
-    Год всегда берётся текущий (по TIMEZONE) — никакого переноса на
-    следующий год не происходит.
-
-    Возвращает (start_date, end_date), либо None при некорректном вводе:
-    - формат не соответствует ДД.ММ[-ДД.ММ]
-    - несуществующая календарная дата (например 31.02)
-    - диапазон "перевёрнут" (конец раньше начала)
-    - дата/диапазон уже полностью в прошлом (в рамках текущего года)
-    """
     match = DATE_RE.match(raw)
     if not match:
         return None
@@ -84,7 +61,7 @@ def parse_date_range(raw: str):
     day1, month1 = int(d1_s), int(m1_s)
 
     today = datetime.now(TIMEZONE).date()
-    year = today.year  # всегда текущий год, без переноса
+    year = today.year
 
     try:
         start = date(year, month1, day1)
@@ -108,7 +85,6 @@ def parse_date_range(raw: str):
     return start, end
 
 
-# ─── Безопасное получение канала (даже если он не в кэше) ────────────────────
 async def resolve_channel(channel_id: int):
     channel = bot.get_channel(channel_id)
     if channel is not None:
@@ -119,7 +95,47 @@ async def resolve_channel(channel_id: int):
         return None
 
 
-# ─── Модалка (форма подачи заявки) ───────────────────────────────────────────
+async def delete_invoking_message(ctx: commands.Context) -> None:
+    try:
+        await ctx.message.delete()
+    except discord.Forbidden:
+        print("⚠️ Не удалось удалить сообщение с командой: боту не хватает права «Управление сообщениями».")
+    except discord.HTTPException:
+        pass
+
+
+def exact_command_only(ctx: commands.Context) -> bool:
+    return ctx.message.content.strip() == f"{ctx.prefix}{ctx.invoked_with}"
+
+
+bot.add_check(exact_command_only)
+
+
+DAY_NAMES = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
+DAY_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+
+
+def build_schedule_embed(days: list) -> discord.Embed:
+    embed = discord.Embed(title="🗓️ Расписание недели", color=discord.Color.blurple())
+    for name, is_green in zip(DAY_NAMES, days):
+        embed.add_field(name=name, value="🟢" if is_green else "🔴", inline=True)
+    return embed
+
+
+def build_schedule_view(message_id: int, days: list) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    for index, (short, is_green) in enumerate(zip(DAY_SHORT, days)):
+        style = discord.ButtonStyle.success if is_green else discord.ButtonStyle.danger
+        view.add_item(
+            discord.ui.Button(
+                label=short,
+                style=style,
+                custom_id=f"schedule:{message_id}:{index}",
+            )
+        )
+    return view
+
+
 class NeyavkaModal(discord.ui.Modal, title="Заявка на неявку — STALZONE"):
     nickname = discord.ui.TextInput(
         label="Ник в игре STALZONE",
@@ -148,7 +164,7 @@ class NeyavkaModal(discord.ui.Modal, title="Заявка на неявку — S
         if channel_id is None:
             await interaction.response.send_message(
                 "⚠️ Канал для приёма заявок ещё не настроен. "
-                "Администратор должен выполнить команду `!here` в нужном канале.",
+                "Администратор должен выполнить команду `!канал-неявка` в нужном канале.",
                 ephemeral=True,
             )
             return
@@ -156,7 +172,7 @@ class NeyavkaModal(discord.ui.Modal, title="Заявка на неявку — S
         channel = await resolve_channel(channel_id)
         if channel is None:
             await interaction.response.send_message(
-                "⚠️ Не удалось найти сохранённый канал. Настройте его заново через `!here`.",
+                "⚠️ Не удалось найти сохранённый канал. Настройте его заново через `!канал-неявка`.",
                 ephemeral=True,
             )
             return
@@ -187,14 +203,13 @@ class NeyavkaModal(discord.ui.Modal, title="Заявка на неявку — S
         embed.add_field(name="Ник в игре", value=self.nickname.value, inline=False)
         embed.add_field(name="Даты отсутствия", value=dates_display, inline=False)
         embed.add_field(name="Причина", value=self.reason.value, inline=False)
-        # Упоминание внутри embed — рендерится кликабельным, но НЕ пингует автора
         embed.add_field(name="Оставил(а) заявку", value=interaction.user.mention, inline=False)
         embed.set_footer(text="Сообщение удалится автоматически по окончании периода неявки")
 
         try:
             sent_message = await channel.send(
                 embed=embed,
-                allowed_mentions=discord.AllowedMentions.none(),  # доп. гарантия от пинга
+                allowed_mentions=discord.AllowedMentions.none(),
             )
         except discord.Forbidden:
             await interaction.response.send_message(
@@ -206,9 +221,14 @@ class NeyavkaModal(discord.ui.Modal, title="Заявка на неявку — S
         delete_at = datetime.combine(end_date + timedelta(days=1), time.min, tzinfo=TIMEZONE)
         state["pending_deletions"].append(
             {
-                "message_id": sent_message.id,
+                "guild_id": interaction.guild_id,
                 "channel_id": channel.id,
+                "message_id": sent_message.id,
                 "delete_at": delete_at.isoformat(),
+                "nickname": self.nickname.value,
+                "dates_display": dates_display,
+                "reason": self.reason.value,
+                "author_id": interaction.user.id,
             }
         )
         save_state()
@@ -216,10 +236,9 @@ class NeyavkaModal(discord.ui.Modal, title="Заявка на неявку — S
         await interaction.response.send_message("✅ Заявка на неявку отправлена!", ephemeral=True)
 
 
-# ─── Кнопка «Неявка» ──────────────────────────────────────────────────────────
 class NeyavkaView(discord.ui.View):
     def __init__(self):
-        super().__init__(timeout=None)  # вечная кнопка, переживает рестарт бота
+        super().__init__(timeout=None)
 
     @discord.ui.button(
         label="Неявка",
@@ -230,17 +249,7 @@ class NeyavkaView(discord.ui.View):
         await interaction.response.send_modal(NeyavkaModal())
 
 
-# ─── Удаление сообщений по истечении срока неявки ────────────────────────────
 async def perform_cleanup() -> None:
-    """
-    Одна проверка всех отложенных удалений: находит просроченные записи,
-    удаляет соответствующие сообщения и убирает их из state.
-
-    Вызывается:
-    1) один раз сразу при подключении бота (on_ready) — чтобы наверстать
-       удаления, которые должны были произойти, пока бот был офлайн;
-    2) затем регулярно каждые 30 секунд через cleanup_loop, пока бот работает.
-    """
     now = datetime.now(TIMEZONE)
     still_pending = []
     changed = False
@@ -260,6 +269,16 @@ async def perform_cleanup() -> None:
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 pass
 
+        state["history"].append(
+            {
+                "guild_id": entry["guild_id"],
+                "nickname": entry["nickname"],
+                "dates_display": entry["dates_display"],
+                "reason": entry["reason"],
+                "author_id": entry["author_id"],
+            }
+        )
+
     if changed:
         state["pending_deletions"] = still_pending
         save_state()
@@ -275,12 +294,10 @@ async def before_cleanup():
     await bot.wait_until_ready()
 
 
-# ─── События и команды ────────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
     bot.add_view(NeyavkaView())
 
-    # Наверстываем удаления, которые должны были произойти, пока бот был офлайн
     await perform_cleanup()
 
     if not cleanup_loop.is_running():
@@ -289,9 +306,33 @@ async def on_ready():
     print(f"✅ Бот запущен: {bot.user} (ID: {bot.user.id})")
 
 
-@bot.command(name="button")
+@bot.event
+async def on_interaction(interaction: discord.Interaction):
+    if interaction.type != discord.InteractionType.component:
+        return
+
+    custom_id = (interaction.data or {}).get("custom_id", "")
+    if not custom_id.startswith("schedule:"):
+        return
+
+    _, message_id_s, day_index_s = custom_id.split(":")
+    schedule = state["schedules"].get(message_id_s)
+    if schedule is None:
+        await interaction.response.send_message("⚠️ Это расписание больше не найдено.", ephemeral=True)
+        return
+
+    day_index = int(day_index_s)
+    schedule["days"][day_index] = not schedule["days"][day_index]
+    save_state()
+
+    embed = build_schedule_embed(schedule["days"])
+    view = build_schedule_view(int(message_id_s), schedule["days"])
+    await interaction.response.edit_message(embed=embed, view=view)
+
+
+@bot.command(name="кнопка-неявка")
 @commands.has_permissions(manage_guild=True)
-async def button_cmd(ctx: commands.Context):
+async def knopka_cmd(ctx: commands.Context):
     embed = discord.Embed(
         title="📋 Отметка о неявке — STALZONE",
         description=(
@@ -301,21 +342,114 @@ async def button_cmd(ctx: commands.Context):
         color=discord.Color.red(),
     )
     await ctx.send(embed=embed, view=NeyavkaView())
+    await delete_invoking_message(ctx)
 
 
-@bot.command(name="here")
+@bot.command(name="канал-неявка")
 @commands.has_permissions(manage_guild=True)
-async def here_cmd(ctx: commands.Context):
+async def kanal_cmd(ctx: commands.Context):
     state["channels"][str(ctx.guild.id)] = ctx.channel.id
     save_state()
     await ctx.send(f"✅ Заявки о неявке теперь будут приходить в канал {ctx.channel.mention}.")
+    await delete_invoking_message(ctx)
 
 
-@button_cmd.error
-@here_cmd.error
+@bot.command(name="отчёт-неявка")
+@commands.has_permissions(manage_guild=True)
+async def report_cmd(ctx: commands.Context):
+    guild_id = ctx.guild.id
+    entries = [e for e in state["history"] if e["guild_id"] == guild_id]
+
+    if not entries:
+        await ctx.send("ℹ️ Нет новых завершившихся неявок для отчёта.")
+        return
+
+    CHUNK_SIZE = 25
+    chunks = [entries[i:i + CHUNK_SIZE] for i in range(0, len(entries), CHUNK_SIZE)]
+
+    for idx, chunk in enumerate(chunks, start=1):
+        title = "📊 Отчёт по завершившимся неявкам"
+        if len(chunks) > 1:
+            title += f" ({idx}/{len(chunks)})"
+
+        embed = discord.Embed(
+            title=title,
+            color=discord.Color.orange(),
+            timestamp=datetime.now(TIMEZONE),
+        )
+        for entry in chunk:
+            embed.add_field(
+                name=f"{entry['nickname']} ({entry['dates_display']})",
+                value=f"<@{entry['author_id']}> — {entry['reason']}",
+                inline=False,
+            )
+        await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
+    state["history"] = [e for e in state["history"] if e["guild_id"] != guild_id]
+    save_state()
+
+
+@bot.command(name="расписание")
+@commands.has_permissions(manage_guild=True)
+async def schedule_cmd(ctx: commands.Context):
+    days = [True] * 7
+    embed = build_schedule_embed(days)
+    sent = await ctx.send(embed=embed)
+    view = build_schedule_view(sent.id, days)
+    await sent.edit(view=view)
+    view.stop()
+
+    state["schedules"][str(sent.id)] = {
+        "guild_id": ctx.guild.id,
+        "channel_id": ctx.channel.id,
+        "days": days,
+    }
+    save_state()
+
+    await delete_invoking_message(ctx)
+
+
+@bot.command(name="помощь")
+async def help_cmd(ctx: commands.Context):
+    embed = discord.Embed(title="📖 Список команд", color=discord.Color.blurple())
+    embed.add_field(
+        name="!кнопка-неявка",
+        value="Публикует кнопку «Неявка» — по ней открывается форма подачи заявки.",
+        inline=False,
+    )
+    embed.add_field(
+        name="!канал-неявка",
+        value="Делает текущий канал каналом приёма заявок о неявке.",
+        inline=False,
+    )
+    embed.add_field(
+        name="!отчёт-неявка",
+        value="Показывает список всех, кто был в неявке с момента прошлого отчёта.",
+        inline=False,
+    )
+    embed.add_field(
+        name="!расписание",
+        value="Публикует расписание на неделю с кнопками-переключателями по дням.",
+        inline=False,
+    )
+    embed.add_field(
+        name="!помощь",
+        value="Показывает этот список команд.",
+        inline=False,
+    )
+    await ctx.send(embed=embed)
+
+
+@knopka_cmd.error
+@kanal_cmd.error
+@report_cmd.error
+@schedule_cmd.error
+@help_cmd.error
 async def setup_commands_error(ctx: commands.Context, error: commands.CommandError):
     if isinstance(error, commands.MissingPermissions):
         await ctx.send("⛔ У вас нет прав для использования этой команды (нужны права «Управление сервером»).")
+    elif isinstance(error, commands.CheckFailure):
+        pass
     else:
         raise error
 
