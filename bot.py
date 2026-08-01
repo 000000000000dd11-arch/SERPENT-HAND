@@ -113,12 +113,19 @@ bot.add_check(exact_command_only)
 
 DAY_NAMES = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
 DAY_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+DAY_TYPES = ["Потасовка", "Потасовка", "Потасовка", "Турнир", "Турнир", "Турнир", "Потасовка"]
 
 
 def build_schedule_embed(days: list) -> discord.Embed:
-    embed = discord.Embed(title="🗓️ Расписание недели", color=discord.Color.blurple())
-    for name, is_green in zip(DAY_NAMES, days):
-        embed.add_field(name=name, value="🟢" if is_green else "🔴", inline=True)
+    lines = []
+    for name, is_green, day_type in zip(DAY_NAMES, days, DAY_TYPES):
+        dot = "🟢" if is_green else "🔴"
+        lines.append(f'{dot} {name} "{day_type}"')
+    embed = discord.Embed(
+        title="🗓️ Расписание клановых войн",
+        description="\n".join(lines),
+        color=discord.Color.blurple(),
+    )
     return embed
 
 
@@ -315,6 +322,13 @@ async def on_interaction(interaction: discord.Interaction):
     if not custom_id.startswith("schedule:"):
         return
 
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "⛔ Изменять расписание клановых войн может только администратор.",
+            ephemeral=True,
+        )
+        return
+
     _, message_id_s, day_index_s = custom_id.split(":")
     schedule = state["schedules"].get(message_id_s)
     if schedule is None:
@@ -429,7 +443,7 @@ async def help_cmd(ctx: commands.Context):
     )
     embed.add_field(
         name="!расписание",
-        value="Публикует расписание на неделю с кнопками-переключателями по дням.",
+        value="Публикует расписание клановых войн с кнопками-переключателями (менять дни могут только администраторы).",
         inline=False,
     )
     embed.add_field(
